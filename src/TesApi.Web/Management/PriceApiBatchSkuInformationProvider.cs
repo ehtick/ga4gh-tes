@@ -5,12 +5,16 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
-using LazyCache;
+using CommonUtilities.AzureCloud;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using Tes.ApiClients;
+using Tes.ApiClients.Models.Pricing;
 using Tes.Models;
-using TesApi.Web.Management.Clients;
+using BatchModels = Azure.ResourceManager.Batch.Models;
 
 namespace TesApi.Web.Management
 {
@@ -19,24 +23,46 @@ namespace TesApi.Web.Management
     /// </summary>
     public class PriceApiBatchSkuInformationProvider : IBatchSkuInformationProvider
     {
+        internal const int StartingLun = 0;
         private readonly PriceApiClient priceApiClient;
-        private readonly IAppCache appCache;
+        private readonly IMemoryCache appCache;
+        private readonly AzureCloudConfig azureCloudConfig;
+        private readonly bool IsTerraConfigured;
         private readonly ILogger logger;
+
+        private static object VmSizesAndPricesKey(string region) => $"VmSizesAndPrices-{region}";
+        private static object StorageDisksAndPricesKey(string region) => $"StorageDisksAndPrices-{region}";
+        private static object StorageDisksAndPricesKey(string region, double capacity, int maxDataDiskCount) => $"StorageDisksAndPrices-{region}-{capacity.ToString(System.Globalization.CultureInfo.InvariantCulture)}-{maxDataDiskCount.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
+
+        /// <summary>
+        /// Converts <see cref="StorageDiskPriceInformation"/> to <see cref="VmDataDisks"/>.
+        /// </summary>
+        /// <param name="disk"><see cref="StorageDiskPriceInformation"/>.</param>
+        /// <param name="lun">lun.</param>
+        /// <param name="storageAccountType">Type of the storage account.</param>
+        /// <param name="caching">The caching.</param>
+        /// <returns></returns>
+        public static VmDataDisks ToVmDataDisk(StorageDiskPriceInformation disk, int lun, BatchModels.BatchStorageAccountType storageAccountType, BatchModels.BatchDiskCachingType? caching) => new(disk.PricePerHour, lun, disk.CapacityInGiB, caching?.ToString(), storageAccountType.ToString());
 
         /// <summary>
         /// Constructor of PriceApiBatchSkuInformationProvider
         /// </summary>
         /// <param name="appCache">Cache instance. If null, calls to the retail pricing API won't be cached.</param>
         /// <param name="priceApiClient">Retail pricing API client.</param>
+        /// <param name="azureCloudConfig"></param>
+        /// <param name="isTerraConfigured"></param>
         /// <param name="logger">Logger instance. </param>
-        public PriceApiBatchSkuInformationProvider(IAppCache appCache, PriceApiClient priceApiClient,
-            ILogger<PriceApiBatchSkuInformationProvider> logger)
+        public PriceApiBatchSkuInformationProvider(IMemoryCache appCache, PriceApiClient priceApiClient, AzureCloudConfig azureCloudConfig,
+            bool isTerraConfigured, ILogger<PriceApiBatchSkuInformationProvider> logger)
         {
             ArgumentNullException.ThrowIfNull(priceApiClient);
+            ArgumentNullException.ThrowIfNull(azureCloudConfig);
             ArgumentNullException.ThrowIfNull(logger);
 
             this.appCache = appCache;
             this.priceApiClient = priceApiClient;
+            this.azureCloudConfig = azureCloudConfig;
+            IsTerraConfigured = isTerraConfigured;
             this.logger = logger;
         }
 
@@ -44,88 +70,199 @@ namespace TesApi.Web.Management
         /// Constructor of PriceApiBatchSkuInformationProvider.
         /// </summary>
         /// <param name="priceApiClient">Retail pricing API client.</param>
+        /// <param name="azureCloudConfig"></param>
         /// <param name="logger">Logger instance.</param>
-        public PriceApiBatchSkuInformationProvider(PriceApiClient priceApiClient,
+        internal PriceApiBatchSkuInformationProvider(PriceApiClient priceApiClient, AzureCloudConfig azureCloudConfig,
             ILogger<PriceApiBatchSkuInformationProvider> logger)
-            : this(null, priceApiClient, logger)
-        {
-        }
+            : this(null, priceApiClient, azureCloudConfig, false, logger)
+        { }
 
         /// <inheritdoc />
-        public async Task<List<VirtualMachineInformation>> GetVmSizesAndPricesAsync(string region)
+        public async Task<List<VirtualMachineInformation>> GetVmSizesAndPricesAsync(string region, CancellationToken cancellationToken)
         {
             if (appCache is null)
             {
-                return await GetVmSizesAndPricesAsyncImpl(region);
+                return await GetVmSizesAndPricesImplAsync(region, cancellationToken);
             }
 
-            logger.LogInformation($"Trying to get pricing information from the cache for region: {region}.");
+            logger.LogInformation("Trying to get pricing information from the cache for region: {Region}.", region);
 
-            return await appCache.GetOrAddAsync(region, async () => await GetVmSizesAndPricesAsyncImpl(region));
+            return await appCache.GetOrCreateAsync(VmSizesAndPricesKey(region), async entry => { entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromDays(1); return await GetVmSizesAndPricesImplAsync(region, cancellationToken); });
         }
 
-        private async Task<List<VirtualMachineInformation>> GetVmSizesAndPricesAsyncImpl(string region)
+        /// <inheritdoc />
+        public async Task<List<VmDataDisks>> GetStorageDisksAndPricesAsync(string region, double capacity, int maxDataDiskCount, CancellationToken cancellationToken)
         {
-            logger.LogInformation($"Getting VM sizes and price information for region:{region}");
-
-            var localVmSizeInfoForBatchSupportedSkus = (await GetLocalVmSizeInformationForBatchSupportedSkusAsync()).Where(x => x.RegionsAvailable.Contains(region, StringComparer.OrdinalIgnoreCase));
-            var pricingItems = await priceApiClient.GetAllPricingInformationForNonWindowsAndNonSpotVmsAsync(region)
-                .ToListAsync();
-
-            logger.LogInformation($"Received {pricingItems.Count} pricing items");
-
-            var vmInfoList = new List<VirtualMachineInformation>();
-
-            foreach (var vm in localVmSizeInfoForBatchSupportedSkus)
+            if (IsTerraConfigured) // Terra does not support adding additional data disks
             {
-
-                var instancePricingInfo = pricingItems.Where(p => p.armSkuName == vm.VmSize).ToList();
-                var normalPriorityInfo = instancePricingInfo.FirstOrDefault(s =>
-                    s.skuName.Contains(" Low Priority", StringComparison.OrdinalIgnoreCase));
-                var lowPriorityInfo = instancePricingInfo.FirstOrDefault(s =>
-                    !s.skuName.Contains(" Low Priority", StringComparison.OrdinalIgnoreCase));
-
-                if (lowPriorityInfo is not null)
-                {
-                    vmInfoList.Add(CreateVirtualMachineInfoFromReference(vm, true,
-                        Convert.ToDecimal(lowPriorityInfo.unitPrice)));
-                }
-
-                if (normalPriorityInfo is not null)
-                {
-                    vmInfoList.Add(CreateVirtualMachineInfoFromReference(vm, false,
-                        Convert.ToDecimal(normalPriorityInfo.unitPrice)));
-                }
+                return [];
             }
 
-            logger.LogInformation(
-                $"Returning {vmInfoList.Count} Vm information entries with pricing for Azure Batch Supported Vm types");
+            if (appCache is null)
+            {
+                return await GetStorageDisksAndPricesImplAsync(region, capacity, maxDataDiskCount, cancellationToken);
+            }
 
-            return vmInfoList;
+            logger.LogInformation("Trying to get pricing information from the cache for region: {Region}.", region);
 
+            return await appCache.GetOrCreateAsync(StorageDisksAndPricesKey(region, capacity, maxDataDiskCount), async entry => { entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromDays(1); return await GetStorageDisksAndPricesImplAsync(region, capacity, maxDataDiskCount, cancellationToken); });
+        }
+
+        private async Task<List<VirtualMachineInformation>> GetVmSizesAndPricesImplAsync(string region, CancellationToken cancellationToken)
+        {
+            logger.LogInformation("Getting VM sizes and price information for region: {Region}", region);
+
+            var localVmSizeInfoForBatchSupportedSkus = (await GetLocalDataAsync<VirtualMachineInformation>($"BatchSupportedVmSizeInformation_{azureCloudConfig.Name.ToUpperInvariant()}.json", "Reading local VM size information from file: {LocalVmPriceList}", cancellationToken))
+                .Where(x => x.RegionsAvailable.Contains(region, StringComparer.OrdinalIgnoreCase))
+                .ToList();
+
+            logger.LogInformation("localVmSizeInfoForBatchSupportedSkus.Count: {CountOfPrepreparedSkuRecordsInRegion}", localVmSizeInfoForBatchSupportedSkus.Count);
+
+            try
+            {
+                var pricingItems = await priceApiClient.GetAllPricingInformationForNonWindowsAndNonSpotVmsAsync(region, cancellationToken).ToListAsync(cancellationToken);
+
+                logger.LogInformation("Received {CountOfSkuPrice} SKU pricing items", pricingItems.Count);
+
+                if (pricingItems == null || pricingItems.Count == 0)
+                {
+                    logger.LogWarning("No pricing information received from the retail pricing API. Reverting to local pricing data.");
+                    return new List<VirtualMachineInformation>(localVmSizeInfoForBatchSupportedSkus);
+                }
+
+                var vmInfoList = new List<VirtualMachineInformation>();
+
+                foreach (var vm in localVmSizeInfoForBatchSupportedSkus.Where(v => !v.LowPriority))
+                {
+                    var instancePricingInfo = pricingItems.Where(p => p.armSkuName == vm.VmSize && p.effectiveStartDate < DateTime.UtcNow).ToList();
+                    var normalPriorityInfo = instancePricingInfo.Where(s =>
+                        !s.skuName.Contains(" Low Priority", StringComparison.OrdinalIgnoreCase)).MaxBy(p => p.effectiveStartDate);
+                    var lowPriorityInfo = instancePricingInfo.Where(s =>
+                        s.skuName.Contains(" Low Priority", StringComparison.OrdinalIgnoreCase)).MaxBy(p => p.effectiveStartDate);
+
+                    if (lowPriorityInfo is not null)
+                    {
+                        vmInfoList.Add(CreateVirtualMachineInfoFromReference(vm, true,
+                            Convert.ToDecimal(lowPriorityInfo.unitPrice)));
+                    }
+
+                    if (normalPriorityInfo is not null)
+                    {
+                        vmInfoList.Add(CreateVirtualMachineInfoFromReference(vm, false,
+                            Convert.ToDecimal(normalPriorityInfo.unitPrice)));
+                    }
+                }
+
+                logger.LogInformation(
+                    "Returning {CountOfSupportedVmSkus} Vm information entries with pricing for Azure Batch Supported Vm types.", vmInfoList.Count);
+
+                return vmInfoList;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex,
+                    $"Exception encountered retrieving live pricing data, reverting to local pricing data.");
+                return new(localVmSizeInfoForBatchSupportedSkus.Select(sku => { sku.RegionsAvailable = []; return sku; }));
+            }
         }
 
         private static VirtualMachineInformation CreateVirtualMachineInfoFromReference(
             VirtualMachineInformation vmReference, bool isLowPriority, decimal pricePerHour)
-            => new()
-            {
-                LowPriority = isLowPriority,
-                MaxDataDiskCount = vmReference.MaxDataDiskCount,
-                MemoryInGiB = vmReference.MemoryInGiB,
-                VCpusAvailable = vmReference.VCpusAvailable,
-                PricePerHour = pricePerHour,
-                ResourceDiskSizeInGiB = vmReference.ResourceDiskSizeInGiB,
-                VmFamily = vmReference.VmFamily,
-                VmSize = vmReference.VmSize,
-                RegionsAvailable = vmReference.RegionsAvailable,
-                HyperVGenerations = vmReference.HyperVGenerations
-            };
-
-        private static async Task<List<VirtualMachineInformation>> GetLocalVmSizeInformationForBatchSupportedSkusAsync()
         {
-            return JsonConvert.DeserializeObject<List<VirtualMachineInformation>>(
-                await File.ReadAllTextAsync(Path.Combine(AppContext.BaseDirectory,
-                    "BatchSupportedVmSizeInformation.json")));
+            var result = VirtualMachineInformation.Clone(vmReference);
+            result.LowPriority = isLowPriority;
+            result.PricePerHour = pricePerHour;
+            result.RegionsAvailable = []; // Not used by TES outside of this method & this array inflates object sizes in task returns and task repository needlessly.
+            return result;
+        }
+
+        private async Task<List<VmDataDisks>> GetStorageDisksAndPricesImplAsync(string region, double capacity, int maxDataDiskCount, CancellationToken cancellationToken)
+        {
+            logger.LogInformation("Getting VM sizes and price information for region: {Region}", region);
+
+            var localStorageDisksAndPrices = (await GetLocalDataAsync<StorageDiskPriceInformation>("BatchDataDiskInformation.json", "Reading local storage disk information from file: {LocalStoragePriceList}", cancellationToken)).Where(disk => disk.CapacityInGiB > 0).ToList();
+
+            logger.LogInformation("localStorageDisksAndPrices.Count: {CountOfLocalStorageDisks}", localStorageDisksAndPrices.Count);
+
+            try
+            {
+                var pricingItems = await (appCache?.GetOrCreateAsync(StorageDisksAndPricesKey(region), async entry => { entry.AbsoluteExpirationRelativeToNow = TimeSpan.FromDays(1); return await GetPricingData(priceApiClient, region, cancellationToken); }) ?? GetPricingData(priceApiClient, region, cancellationToken));
+                logger.LogInformation("Received {CountOfDataDiskPrice} Storage pricing items", pricingItems.Count);
+
+                if (pricingItems.Count == 0)
+                {
+                    logger.LogWarning("No pricing information received from the retail pricing API. Reverting to local pricing data.");
+                    return DetermineDisks(localStorageDisksAndPrices, capacity, maxDataDiskCount);
+                }
+
+                return DetermineDisks(pricingItems.Select(item => new StorageDiskPriceInformation(name: item.meterName, capacity: StorageDiskPriceInformation.StandardLrsSsdCapacityInGiB[item.meterName], price: Convert.ToDecimal(item.unitPrice))), capacity, maxDataDiskCount);
+
+                async static Task<List<PricingItem>> GetPricingData(PriceApiClient priceApiClient, string region, CancellationToken cancellationToken)
+                {
+                    return await priceApiClient.GetAllPricingInformationForStandardStorageLRSDisksAsync(region, cancellationToken)
+                        .Where(item => StorageDiskPriceInformation.StandardLrsSsdCapacityInGiB.ContainsKey(item.meterName))
+                        .Distinct(new MeterNameStoragePricingItemEqualityComparer())
+                        .ToListAsync(cancellationToken);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex,
+                    $"Exception encountered retrieving live pricing data, reverting to local pricing data.");
+                return DetermineDisks(localStorageDisksAndPrices, capacity, maxDataDiskCount);
+            }
+        }
+
+        internal static List<VmDataDisks> DetermineDisks(IEnumerable<StorageDiskPriceInformation> diskPriceInformation, double capacity, int maxDataDiskCount)
+        {
+            if (maxDataDiskCount <= 0)
+            {
+                return []; // No disks can be added
+            }
+
+            var diskPricesBySize = diskPriceInformation.ToDictionary(disk => disk.CapacityInGiB);
+
+            if (FindSizeMinimumGreaterOrEqualIfExistsOrMaximum(diskPricesBySize.Keys, capacity) * maxDataDiskCount < capacity)
+            {
+                return []; // Sufficient total capacity cannot be added
+            }
+
+            var perDiskCapacity = FindSizeMinimumGreaterOrEqualIfExistsOrMaximum(diskPricesBySize.Keys, capacity / maxDataDiskCount);
+            return Enumerable.Repeat(diskPricesBySize[perDiskCapacity], (int)Math.Round(capacity / perDiskCapacity, MidpointRounding.ToPositiveInfinity))
+                .Select((disk, i) => ToVmDataDisk(disk, StartingLun + i, BatchModels.BatchStorageAccountType.StandardSsdLrs, BatchModels.BatchDiskCachingType.ReadOnly))
+                .ToList();
+
+            static int FindSizeMinimumGreaterOrEqualIfExistsOrMaximum(IEnumerable<int> availableSizes, double request)
+            {
+                try
+                {
+                    return availableSizes.Where(size => size >= request).Min();
+                }
+                catch (InvalidOperationException)
+                {
+                    return availableSizes.Max();
+                }
+            }
+        }
+
+        private async Task<List<T>> GetLocalDataAsync<T>(string fileName, string logMessage, CancellationToken cancellationToken)
+        {
+            var filePath = Path.Combine(AppContext.BaseDirectory, fileName);
+#pragma warning disable CA2254 // Template should be a static expression
+            logger.LogInformation(logMessage, filePath);
+#pragma warning restore CA2254 // Template should be a static expression
+
+            return JsonConvert.DeserializeObject<List<T>>(
+                await File.ReadAllTextAsync(filePath, cancellationToken));
+        }
+
+        private struct MeterNameStoragePricingItemEqualityComparer : IEqualityComparer<PricingItem>
+        {
+            readonly bool IEqualityComparer<PricingItem>.Equals(PricingItem x, PricingItem y)
+                => x.meterName.Equals(y.meterName, StringComparison.Ordinal);
+
+            readonly int IEqualityComparer<PricingItem>.GetHashCode(PricingItem obj)
+                => obj.meterName.GetHashCode();
         }
     }
 }

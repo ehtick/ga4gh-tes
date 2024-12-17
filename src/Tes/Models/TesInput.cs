@@ -68,6 +68,23 @@ namespace Tes.Models
         public string Content { get; set; }
 
         /// <summary>
+        /// Indicates that the file should not be downloaded
+        /// https://github.com/ga4gh/task-execution-schemas/blob/1df37d34242f74d3f03475c6b9de3324b8094054/openapi/task_execution_service.openapi.yaml#L481
+        /// </summary>
+        /// <value>
+        /// Indicate that a file resource could be accessed using a streaming
+        /// interface, ie a FUSE mounted s3 object. This flag indicates that
+        /// using a streaming mount, as opposed to downloading the whole file to
+        /// the local scratch space, may be faster despite the latency and
+        /// overhead. This does not mean that the backend will use a streaming
+        /// interface, as it may not be provided by the vendor, but if the
+        /// capacity is available it can be used without degrading the
+        /// performance of the underlying program.
+        /// </value>
+        [DataMember(Name = "streamable")]
+        public bool Streamable { get; set; }
+
+        /// <summary>
         /// Returns the string presentation of the object
         /// </summary>
         /// <returns>String presentation of the object</returns>
@@ -80,6 +97,7 @@ namespace Tes.Models
             .Append("  Path: ").Append(Path).Append('\n')
             .Append("  Type: ").Append(Type).Append('\n')
             .Append("  Content: ").Append(Content).Append('\n')
+            .Append("  Streamable: ").Append(Streamable).Append('\n')
             .Append("}\n")
             .ToString();
 
@@ -142,6 +160,9 @@ namespace Tes.Models
                     Content == other.Content ||
                     Content is not null &&
                     Content.Equals(other.Content)
+                ) &&
+                (
+                    Streamable.Equals(other.Streamable)
                 ),
             };
 
@@ -176,10 +197,13 @@ namespace Tes.Models
                 }
 
                 hashCode = hashCode * 59 + Type.GetHashCode();
+
                 if (Content is not null)
                 {
                     hashCode = hashCode * 59 + Content.GetHashCode();
                 }
+
+                hashCode = hashCode * 59 + Streamable.GetHashCode();
 
                 return hashCode;
             }

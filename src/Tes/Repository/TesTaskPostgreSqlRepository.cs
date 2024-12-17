@@ -8,10 +8,16 @@ namespace Tes.Repository
     using System.Diagnostics;
     using System.Linq;
     using System.Linq.Expressions;
+    using System.Reflection;
+    using System.Text.Json;
+    using System.Text.Json.Serialization;
+    using System.Text.Json.Serialization.Metadata;
+    using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.EntityFrameworkCore;
     using Microsoft.Extensions.Logging;
     using Microsoft.Extensions.Options;
+    using Npgsql;
     using Polly;
     using Tes.Models;
     using Tes.Utilities;
@@ -20,25 +26,83 @@ namespace Tes.Repository
     /// A TesTask specific repository for storing the TesTask as JSON within an Entity Framework Postgres table
     /// </summary>
     /// <typeparam name="TesTask"></typeparam>
-    public sealed class TesTaskPostgreSqlRepository : IRepository<TesTask>
+    public sealed class TesTaskPostgreSqlRepository : PostgreSqlCachingRepository<TesTaskDatabaseItem>, IRepository<TesTask>
     {
-        private readonly Func<TesDbContext> createDbContext;
-        private readonly ICache<TesTask> cache;
-        private readonly ILogger logger;
+        // JsonSerializerOptions singleton factory
+        private static readonly Lazy<JsonSerializerOptions> GetSerializerOptions = new(() =>
+        {
+            // Create, configure and return JsonSerializerOptions.
+            JsonSerializerOptions options = new(JsonSerializerOptions.Default)
+            {
+                // Be somewhat minimalistic when serializing. Non-null default property values (for any given type) are still written.
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+
+                // Required since adding modifiers to the default TypeInfoResolver appears to not be possible.
+                TypeInfoResolver = GetAndConfigureTypeInfoResolver()
+            };
+
+            options.MakeReadOnly(populateMissingResolver: true);
+            return options;
+
+            static IJsonTypeInfoResolver GetAndConfigureTypeInfoResolver()
+            {
+                DefaultJsonTypeInfoResolver typeInfoResolver = new();
+                typeInfoResolver.Modifiers.Add(JsonTypeInfoResolverModifier);
+                return typeInfoResolver;
+            }
+        }, LazyThreadSafetyMode.PublicationOnly);
+
+        // DefaultJsonTypeInfoResolver contract modifier to deal with changes to the task JSON.
+        // Actions taken:
+        //     1) Replace the previous WorkflowId property on TesTask (with the TaskSubmitter implementation).
+        //     2) Remove the RegionsAvailable array from VirtualMachineInformation.
+        private static void JsonTypeInfoResolverModifier(JsonTypeInfo typeInfo)
+        {
+            switch (typeInfo.Type)
+            {
+                case Type type when typeof(TesTask).Equals(type):
+                    // Configure tasks created with previous versions of TES when tasks are retrieved.
+                    typeInfo.UnmappedMemberHandling ??= JsonUnmappedMemberHandling.Skip;
+                    typeInfo.OnDeserialized ??= obj => ((TesTask)obj).TaskSubmitter ??= TaskSubmitters.TaskSubmitter.Parse((TesTask)obj);
+                    break;
+
+                case Type type when typeof(VirtualMachineInformation).Equals(type):
+                    // Configure tasks created with previous versions of TES when tasks are retrieved.
+                    typeInfo.OnDeserialized ??= obj => ((VirtualMachineInformation)obj).RegionsAvailable = null;
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// NpgsqlDataSource factory
+        /// </summary>
+        public static Func<string, NpgsqlDataSource> NpgsqlDataSourceFunc => connectionString =>
+            new NpgsqlDataSourceBuilder(connectionString)
+                .ConfigureJsonOptions(serializerOptions: GetSerializerOptions.Value)
+                .EnableDynamicJson(jsonbClrTypes: [typeof(TesTask)])
+                .Build();
+
+        /// <summary>
+        /// Configure options specific to PostgreSQL for a <see cref="DbContext" />
+        /// </summary>
+        public static void NpgsqlDbContextOptionsBuilder(Npgsql.EntityFrameworkCore.PostgreSQL.Infrastructure.NpgsqlDbContextOptionsBuilder options)
+        {
+            options.MaxBatchSize(1000);
+        }
 
         /// <summary>
         /// Default constructor that also will create the schema if it does not exist
         /// </summary>
-        /// <param name="connectionString">The PostgreSql connection string</param>
-        public TesTaskPostgreSqlRepository(IOptions<PostgreSqlOptions> options, ILogger<TesTaskPostgreSqlRepository> logger, ICache<TesTask> cache = null)
+        /// <param name="options"></param>
+        /// <param name="hostApplicationLifetime">Used for requesting termination of the current application if the writer task unexpectedly exits.</param>
+        /// <param name="logger">Logging interface.</param>
+        /// <param name="cache">Memory cache for fast access to active items.</param>
+        public TesTaskPostgreSqlRepository(IOptions<PostgreSqlOptions> options, Microsoft.Extensions.Hosting.IHostApplicationLifetime hostApplicationLifetime, ILogger<TesTaskPostgreSqlRepository> logger, ICache<TesTaskDatabaseItem> cache = null)
+            : base(hostApplicationLifetime, logger, cache)
         {
-            this.cache = cache;
-            this.logger = logger;
-            var connectionString = new ConnectionStringUtility().GetPostgresConnectionString(options);
-            createDbContext = () => { return new TesDbContext(connectionString); };
-            using var dbContext = createDbContext();
-            dbContext.Database.MigrateAsync().Wait();
-            WarmCacheAsync().Wait();
+            var dataSource = NpgsqlDataSourceFunc(ConnectionStringUtility.GetPostgresConnectionString(options)); // The datasource itself must be essentially a singleton.
+            CreateDbContext = Initialize(() => new TesDbContext(dataSource, NpgsqlDbContextOptionsBuilder));
+            WarmCacheAsync(CancellationToken.None).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -46,22 +110,28 @@ namespace Tes.Repository
         /// </summary>
         /// <param name="createDbContext">A delegate that creates a TesTaskPostgreSqlRepository context</param>
         public TesTaskPostgreSqlRepository(Func<TesDbContext> createDbContext)
+            : base(default)
         {
-            this.createDbContext = createDbContext;
-            using var dbContext = createDbContext();
-            dbContext.Database.MigrateAsync().Wait();
+            CreateDbContext = Initialize(createDbContext);
         }
 
-        private async Task WarmCacheAsync()
+        private static Func<TesDbContext> Initialize(Func<TesDbContext> createDbContext)
         {
-            if (cache == null)
+            using var dbContext = createDbContext();
+            dbContext.Database.MigrateAsync(CancellationToken.None).GetAwaiter().GetResult();
+            return createDbContext;
+        }
+
+        private async Task WarmCacheAsync(CancellationToken cancellationToken)
+        {
+            if (Cache is null)
             {
-                logger.LogWarning("Cache is null for TesTaskPostgreSqlRepository; no caching will be used.");
+                Logger?.LogWarning("Cache is null for TesTaskPostgreSqlRepository; no caching will be used.");
                 return;
             }
 
             var sw = Stopwatch.StartNew();
-            logger.LogInformation("Warming cache...");
+            Logger?.LogInformation("Warming cache...");
 
             // Don't allow the state of the system to change until the cache and system are consistent;
             // this is a fast PostgreSQL query even for 1 million items
@@ -70,181 +140,270 @@ namespace Tes.Repository
                 .WaitAndRetryAsync(3,
                     retryAttempt =>
                     {
-                        logger.LogWarning($"Warming cache retry attempt #{retryAttempt}");
+                        Logger?.LogWarning("Warming cache retry attempt #{RetryAttempt}", retryAttempt);
                         return TimeSpan.FromSeconds(10);
                     },
                     (ex, ts) =>
                     {
-                        logger.LogCritical(ex, "Couldn't warm cache, is the database online?");
+                        Logger?.LogCritical(ex, "Couldn't warm cache, is the database online?");
                     })
-                .ExecuteAsync(async () =>
+                .ExecuteAsync(async ct =>
                 {
-                    var activeTasks = await GetItemsAsync(task => TesTask.ActiveStates.Contains(task.State));
-                    var tasksAddedCount = 0;
-
-                    foreach (var task in activeTasks.OrderBy(t => t.CreationTime))
-                    {
-                        cache?.TryAdd(task.Id, task);
-                        tasksAddedCount++;
-                    }
-
-                    logger.LogInformation($"Cache warmed successfully in {sw.Elapsed.TotalSeconds:n3} seconds. Added {tasksAddedCount:n0} items to the cache.");
-                });
+                    var activeTasksCount = (await InternalGetItemsAsync(
+                            ct,
+                            orderBy: q => q.OrderBy(t => t.Json.CreationTime),
+                            efPredicates: Enumerable.Empty<Expression<Func<TesTask, bool>>>().Append(task => TesTask.ActiveStates.Contains(task.State))))
+                        .Count();
+                    Logger?.LogInformation("Cache warmed successfully in {TotalSeconds:n3} seconds. Added {TasksAddedCount:n0} items to the cache.", sw.Elapsed.TotalSeconds, activeTasksCount);
+                }, cancellationToken);
         }
 
 
-        /// <summary>
-        /// Get a TesTask by the TesTask.ID
-        /// </summary>
-        /// <param name="id">The TesTask's ID</param>
-        /// <param name="onSuccess">Delegate to be invoked on success</param>
-        /// <returns></returns>
-        public async Task<bool> TryGetItemAsync(string id, Action<TesTask> onSuccess = null)
+        /// <inheritdoc/>
+        public async Task<bool> TryGetItemAsync(string id, CancellationToken cancellationToken, Action<TesTask> onSuccess = null)
         {
-            if (cache?.TryGetValue(id, out var task) == true)
-            {
-                onSuccess?.Invoke(task);
-
-                if (!task.IsActiveState())
-                {
-                    // Cache optimization because we can assume that most of the time, the workflow engine will no longer "GET" after a terminal state
-                    cache?.TryRemove(task.Id);
-                }
-
-                return true;
-            }
-
-            using var dbContext = createDbContext();
-
-            // Search for Id within the JSON
-            var item = await dbContext.TesTasks.FirstOrDefaultAsync(t => t.Json.Id == id);
+            var item = await GetItemFromCacheOrDatabase(id, false, cancellationToken);
 
             if (item is null)
             {
                 return false;
             }
 
-            onSuccess?.Invoke(item.Json);
-            cache?.TryAdd(id, item.Json);
+            onSuccess?.Invoke(CopyTesTask(item).TesTask);
+            _ = EnsureActiveItemInCache<TesTask>(item, t => t.Json.Id, t => t.Json.IsActiveState());
             return true;
         }
 
-        /// <summary>
-        /// Get TesTask items
-        /// </summary>
-        /// <param name="predicate">Predicate to query the TesTasks</param>
-        /// <returns></returns>
-        public async Task<IEnumerable<TesTask>> GetItemsAsync(Expression<Func<TesTask, bool>> predicate)
+        /// <inheritdoc/>
+        public async Task<IEnumerable<TesTask>> GetItemsAsync(Expression<Func<TesTask, bool>> predicate, CancellationToken cancellationToken)
         {
-            using var dbContext = createDbContext();
-
-            // Search for items in the JSON
-            var query = dbContext.TesTasks.Select(t => t.Json).Where(predicate);
-
-            //var sqlQuery = query.ToQueryString();
-            //Debugger.Break();
-            return await query.ToListAsync();
+            return (await InternalGetItemsAsync(cancellationToken, efPredicates: [predicate])).Select(t => t.TesTask);
         }
 
-        /// <summary>
-        /// Encapsulates a TesTask as JSON
-        /// </summary>
-        /// <param name="item">TesTask to store as JSON in the database</param>
-        /// <returns></returns>
-        public async Task<TesTask> CreateItemAsync(TesTask item)
+        /// <inheritdoc/>
+        public async Task<TesTask> CreateItemAsync(TesTask task, CancellationToken cancellationToken)
         {
-            using var dbContext = createDbContext();
-            var dbItem = new TesTaskDatabaseItem { Json = item };
-            dbContext.TesTasks.Add(dbItem);
-            await dbContext.SaveChangesAsync();
-            cache?.TryAdd(item.Id, item);
-            return item;
+            var item = new TesTaskDatabaseItem { Json = task };
+            item = await ExecuteNpgsqlActionAsync(async () => await AddUpdateOrRemoveItemInDbAsync(item, WriteAction.Add, cancellationToken));
+            return EnsureActiveItemInCache(item, t => t.Json.Id, t => t.Json.IsActiveState(), CopyTesTask).TesTask;
         }
 
         /// <summary>
         /// Encapsulates TesTasks as JSON
         /// </summary>
         /// <param name="item">TesTask to store as JSON in the database</param>
-        /// <returns></returns>
-        public async Task<List<TesTask>> CreateItemsAsync(List<TesTask> items)
+        /// <param name="cancellationToken">A <see cref="CancellationToken"/> for controlling the lifetime of the asynchronous operation.</param>
+        public async Task<List<TesTask>> CreateItemsAsync(List<TesTask> items, CancellationToken cancellationToken)
+             => [.. (await Task.WhenAll(items.Select(task => CreateItemAsync(task, cancellationToken))))];
+
+        /// <inheritdoc/>
+        public async Task<TesTask> UpdateItemAsync(TesTask tesTask, CancellationToken cancellationToken)
         {
-            using var dbContext = createDbContext();
-
-            foreach (var item in items)
-            {
-                var dbItem = new TesTaskDatabaseItem { Json = item };
-                dbContext.TesTasks.Add(dbItem);
-            }
-
-            await dbContext.SaveChangesAsync();
-            return items;
-        }
-
-        /// <summary>
-        /// Base class searches within model, this method searches within the JSON
-        /// </summary>
-        /// <param name="tesTask"></param>
-        /// <returns></returns>
-        public async Task<TesTask> UpdateItemAsync(TesTask tesTask)
-        {
-            using var dbContext = createDbContext();
-
-            // Manually set entity state to avoid potential NPG PostgreSql bug
-            dbContext.ChangeTracker.AutoDetectChangesEnabled = false;
-            var item = await dbContext.TesTasks.FirstOrDefaultAsync(t => t.Json.Id == tesTask.Id);
-
-            if (item is null)
-            {
-                throw new Exception($"No TesTask with ID {tesTask.Id} found in the database.");
-            }
-
+            var item = await ExecuteNpgsqlActionAsync(async () => await GetItemFromCacheOrDatabase(tesTask.Id, true, cancellationToken));
             item.Json = tesTask;
+            item = await ExecuteNpgsqlActionAsync(async () => await AddUpdateOrRemoveItemInDbAsync(item, WriteAction.Update, cancellationToken));
+            return EnsureActiveItemInCache(item, t => t.Json.Id, t => t.Json.IsActiveState(), CopyTesTask).TesTask;
+        }
 
-            // Manually set entity state to avoid potential NPG PostgreSql bug
-            dbContext.Entry(item).State = EntityState.Modified;
-            await dbContext.SaveChangesAsync();
-            cache?.TryUpdate(tesTask.Id, tesTask);
-            return item.Json;
+        /// <inheritdoc/>
+        public async Task DeleteItemAsync(string id, CancellationToken cancellationToken)
+        {
+            _ = await ExecuteNpgsqlActionAsync(async () => await AddUpdateOrRemoveItemInDbAsync(await GetItemFromCacheOrDatabase(id, true, cancellationToken), WriteAction.Delete, cancellationToken));
+            _ = Cache?.TryRemove(id);
+        }
+
+        internal record struct ContinuationToken(long LastDbId, string Raw, string EF)
+        {
+            private const char EfSeparator = '&';
+
+            internal static ContinuationToken GetToken(FormattableString RawQuery, IEnumerable<Expression<Func<TesTask, bool>>> EfQuery, long? Id = null)
+            {
+                return new(
+                    Id ?? long.MinValue,
+                    RawQuery?.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    EfQuery is null ? null : string.Join(EfSeparator, EfQuery.Select(p => System.Web.HttpUtility.UrlEncode(p.ToString()))));
+            }
+
+            internal readonly string AsString(long? lastId)
+            {
+                return lastId is null
+                    ? null
+                    : Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new(lastId.Value, Raw, EF), SourceGenerationContext.Default.ContinuationToken)));
+            }
+
+            internal readonly ContinuationToken Parse(string previous)
+            {
+                if (string.IsNullOrWhiteSpace(previous))
+                {
+                    return this;
+                }
+
+                var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent((int)Math.Ceiling(previous.Length / 4.0) * 3);
+
+                try
+                {
+                    if (Convert.TryFromBase64String(previous, buffer, out var bytesWritten))
+                    {
+                        var token = JsonSerializer.Deserialize(buffer.AsSpan()[..bytesWritten], SourceGenerationContext.Default.ContinuationToken);
+
+                        if (!(Raw ?? string.Empty).Equals((token.Raw ?? string.Empty), StringComparison.Ordinal) || !(EF ?? string.Empty).Equals((token.EF ?? string.Empty), StringComparison.Ordinal))
+                        {
+                            throw new ArgumentException("Invalid query parameters for page_token.", nameof(previous));
+                        }
+
+                        return token;
+                    }
+                    else
+                    {
+                        throw new ArgumentException("page_token is corrupt or invalid.", nameof(previous));
+                    }
+                }
+                catch (NotSupportedException ex)
+                {
+                    throw new ArgumentException("page_token is corrupt or invalid.", nameof(previous), ex);
+                }
+                catch (JsonException ex)
+                {
+                    throw new ArgumentException("page_token is corrupt or invalid.", nameof(previous), ex);
+                }
+                finally
+                {
+                    System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public async Task<IRepository<TesTask>.GetItemsResult> GetItemsAsync(string continuationToken, int pageSize, CancellationToken cancellationToken, FormattableString rawPredicate, IEnumerable<Expression<Func<TesTask, bool>>> efPredicates)
+        {
+            var token = ContinuationToken.GetToken(rawPredicate, efPredicates).Parse(continuationToken);
+
+            var results = (await InternalGetItemsAsync(
+                    cancellationToken,
+                    pagination: q => q.Where(t => t.Id > token.LastDbId).Take(pageSize),
+                    orderBy: q => q.OrderBy(t => t.Id),
+                    efPredicates: efPredicates,
+                    rawPredicate: rawPredicate))
+                .ToList();
+
+            return new(
+                token.AsString(results.Count == pageSize ? results.LastOrDefault()?.DbId : null),
+                results.Select(t => t.TesTask));
         }
 
         /// <summary>
-        /// Base class deletes by Item.Id, this method deletes by Item.Json.Id
+        /// Retrieves an item from the cache if found, otherwise from the database.
         /// </summary>
         /// <param name="id">TesTask Id</param>
-        /// <returns></returns>
-        public async Task DeleteItemAsync(string id)
+        /// <param name="throwIfNotFound">Throw (instead of return null) if item is not found.</param>
+        /// <param name="cancellationToken">A <see cref="CancellationToken"/> for controlling the lifetime of the asynchronous operation.</param>
+        /// <returns>The found item, or null if not found.</returns>
+        private async Task<TesTaskDatabaseItem> GetItemFromCacheOrDatabase(string id, bool throwIfNotFound, CancellationToken cancellationToken)
         {
-            using var dbContext = createDbContext();
-            var item = await dbContext.TesTasks.FirstOrDefaultAsync(t => t.Json.Id == id);
+            TesTaskDatabaseItem item = default;
 
-            if (item is null)
+            if (!Cache?.TryGetValue(id, out item) ?? true)
             {
-                throw new Exception($"No TesTask with ID {item.Id} found in the database.");
+                using var dbContext = CreateDbContext();
+
+                // Search for Id within the JSON
+                item = await ExecuteNpgsqlActionAsync(async () => await asyncPolicy.ExecuteAsync(ct => dbContext.TesTasks.FirstOrDefaultAsync(t => t.Json.Id == id, ct), cancellationToken));
+
+                if (throwIfNotFound && item is null)
+                {
+                    throw new KeyNotFoundException($"No TesTask with ID {id} found in the database.");
+                }
             }
 
-            dbContext.TesTasks.Remove(item);
-            await dbContext.SaveChangesAsync();
-            cache?.TryRemove(id);
-
+            return item;
         }
 
         /// <summary>
-        /// Identical to GetItemsAsync, paging is not supported. All items are returned
+        /// Stands up TesTask query, ensures that active tasks queried are maintained in the cache. Entry point for all non-single task SELECT queries in the repository.
         /// </summary>
-        /// <param name="predicate">Predicate to query the TesTasks</param>
-        /// <param name="pageSize">Ignored and has no effect</param>
-        /// <param name="continuationToken">Ignored and has no effect</param>
+        /// <param name="cancellationToken">A <see cref="CancellationToken"/> for controlling the lifetime of the asynchronous operation.</param>
+        /// <param name="orderBy"><see cref="IQueryable{TesTaskDatabaseItem}"/> order-by function.</param>
+        /// <param name="pagination"><see cref="IQueryable{TesTaskDatabaseItem}"/> pagination selection (within the order-by).</param>
+        /// <param name="efPredicate">The WHERE clause <see cref="Expression"/> for <see cref="TesTask"/> selection in the query.</param>
+        /// <param name="rawPredicate">The WHERE clause for raw SQL for <see cref="TesTaskDatabaseItem"/> selection in the query.</param>
         /// <returns></returns>
-        public async Task<(string, IEnumerable<TesTask>)> GetItemsAsync(Expression<Func<TesTask, bool>> predicate, int pageSize, string continuationToken)
+        private async Task<IEnumerable<GetItemsResult>> InternalGetItemsAsync(CancellationToken cancellationToken, Func<IQueryable<TesTaskDatabaseItem>, IQueryable<TesTaskDatabaseItem>> orderBy = default, Func<IQueryable<TesTaskDatabaseItem>, IQueryable<TesTaskDatabaseItem>> pagination = default, IEnumerable<Expression<Func<TesTask, bool>>> efPredicates = default, FormattableString rawPredicate = default)
         {
-            // TODO paging support
-            var results = await GetItemsAsync(predicate);
-            return (null, results);
+            using var dbContext = CreateDbContext();
+            return await ExecuteNpgsqlActionAsync(async () =>
+                (await GetItemsAsync(dbContext.TesTasks, cancellationToken, orderBy, pagination, efPredicates?.Select(WhereTesTask), rawPredicate))
+                    .Select(item => EnsureActiveItemInCache(item, t => t.Json.Id, t => t.Json.IsActiveState(), CopyTesTask)));
         }
 
-        public void Dispose()
+        private async Task<T> ExecuteNpgsqlActionAsync<T>(Func<Task<T>> action)
         {
+            try
+            {
+                return await action();
+            }
+            catch (NpgsqlException npgEx) when (npgEx.InnerException is TimeoutException)
+            {
+                Logger?.LogError(npgEx, "PostgreSQL: {NpgsqlTimeoutMessage}", npgEx.Message);
+                throw LogDatabaseOverloadedException(npgEx);
+            }
+            catch (InvalidOperationException ioEx) when (ioEx.InnerException is TimeoutException)
+            {
+                Logger?.LogError(ioEx, "PostgreSQL: {InvalidOpTimeoutMessage}", ioEx.Message);
+                throw LogDatabaseOverloadedException(ioEx);
+            }
+            catch (InvalidOperationException ioEx) when
+                (ioEx.InnerException is NpgsqlException npgSqlEx
+                && npgSqlEx.Message?.StartsWith("The connection pool has been exhausted", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                Logger?.LogError(ioEx, "PostgreSQL: {InvalidOpNpgsqMessage}", ioEx.Message);
+                throw LogDatabaseOverloadedException(ioEx);
+            }
+        }
 
+        public DatabaseOverloadedException LogDatabaseOverloadedException(Exception exception)
+        {
+            var dbException = new DatabaseOverloadedException(exception);
+            Logger?.LogCritical(dbException, "PostgreSQL: {FailureMessage}", dbException.Message);
+            return dbException;
+        }
+
+        /// <summary>
+        /// Transforms <paramref name="predicate"/> into <see cref="Expression{Func{TesTaskDatabaseItem, bool}}"/>.
+        /// </summary>
+        /// <param name="predicate">A <see cref="Expression{Func{TesTask, bool}}"/> to be transformed.</param>
+        /// <returns>A <see cref="Expression{Func{TesTaskDatabaseItem, bool}}"/></returns>
+        private static Expression<Func<TesTaskDatabaseItem, bool>> WhereTesTask(Expression<Func<TesTask, bool>> predicate)
+        {
+            return predicate is null
+                ? null
+                : (Expression<Func<TesTaskDatabaseItem, bool>>)new ExpressionParameterSubstitute(predicate.Parameters[0], GetTask()).Visit(predicate);
+
+            static Expression<Func<TesTaskDatabaseItem, TesTask>> GetTask() => item => item.Json;
+        }
+
+        private record class GetItemsResult(long DbId, TesTask TesTask);
+
+        private GetItemsResult CopyTesTask(TesTaskDatabaseItem item)
+        {
+            return new(item.Id, Newtonsoft.Json.JsonConvert.DeserializeObject<TesTask>(item.Json.ToJson()));
+        }
+
+        /// <inheritdoc/>
+        public ValueTask<bool> TryRemoveItemFromCacheAsync(TesTask item, CancellationToken _1)
+        {
+            return ValueTask.FromResult(Cache?.TryRemove(item.Id) ?? false);
+        }
+
+        /// <inheritdoc/>
+        public FormattableString JsonFormattableRawString(string property, FormattableString sql)
+        {
+            var column = typeof(TesTaskDatabaseItem).GetProperty(nameof(TesTaskDatabaseItem.Json))?.GetCustomAttribute<System.ComponentModel.DataAnnotations.Schema.ColumnAttribute>()?.Name ?? "json";
+            return new PrependableFormattableString($"\"{column}\"->'{property}'", sql);
         }
     }
+
+    [JsonSourceGenerationOptions(WriteIndented = false, GenerationMode = JsonSourceGenerationMode.Default)]
+    [JsonSerializable(typeof(TesTaskPostgreSqlRepository.ContinuationToken))]
+    internal partial class SourceGenerationContext : JsonSerializerContext
+    { }
 }
